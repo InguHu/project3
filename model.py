@@ -48,15 +48,15 @@ class MatchModel(object):
     lm_layer1 = HiddenLayer(pl_input, W=m_w1, b=m_b1)
     rm_layer1 = HiddenLayer(pr_input, W=m_w1, b=m_b1)
     comb_layer = T.concatenate([lm_layer1.output, rm_layer1.output], axis=1)
-    m_layer2 = HiddenLayer(pr_input, W=m_w2, b=m_b2)
-    layer3 = scoreLayer(m_layer0.output, W=o_w1, b=o_b1)
+    m_layer2 = HiddenLayer(comb_layer, W=m_w2, b=m_b2)
+    layer3 = scoreLayer(m_layer2.output, W=o_w1, b=o_b1)
     self.score = layer3.score
 
 
 class train(object):
   def __init__(self, pl_input, pr_input, nl_input, nr_input, allparams, alpha, learning_rate):
     self.params = allparams
-    self.nl_input = nl_input
+    self.pl_input = pl_input
     self.pr_input = pr_input
     self.nl_input = nl_input
     self.nr_input = nr_input
@@ -69,6 +69,7 @@ class train(object):
     self.gpr_input = T.grad(self.cost, self.pr_input)
     self.gnl_input = T.grad(self.cost, self.nl_input)
     self.gnr_input = T.grad(self.cost, self.nr_input)
+    self.output = (self.gpl_input, self.gpr_input, self.gnl_input, self.gnr_input)
     updates = []
 
     for param, gparam in zip(self.params, self.gparams):
@@ -128,6 +129,9 @@ class train_worker(object):
       for line in lines:
         cnt += 1
         sys.stdout.write(str(cnt)+'\r')
+        #if cnt>100000:
+        #  return 0
+
         items = line.split('***|||***')
         align = items[2].split()
         align_vec = []
@@ -135,18 +139,19 @@ class train_worker(object):
           pair = align[i].split(':')
           align_vec.append((int(pair[0])-1,int(pair[1])-1))
         if align_vec[-1][0]+1>len(items[0].split()):
-          print cnt 
+          print cnt
+
         self.sentence.append(([self.ch_vocab[w] for w in items[0].split()],\
                              [self.en_vocab[w] for w in items[1].split()],align_vec))
     print "reading the train data finished."
   
-  def get_window(selif,pos,sen_id,ch=1):
+  def get_window(self,pos,sen_id,ch=1):
     if ch==1:
       sen_len = len(self.sentence[sen_id][0])
     else:
       sen_len = len(self.sentence[sen_id][1])
     win_emb = zeros((1,250), dtype='float32')
-    win_id = zeros((1,5), dtype='int32')
+    win_id = []
 
     j = 0
     for i in xrange(-2,3):
@@ -154,17 +159,17 @@ class train_worker(object):
       if ch==1:
         if sen_pos< 0 or sen_pos > sen_len-1:
           win_emb[0][j*50:(j+1)*50] = 0.0 
-          win_id[0][j] = -1
+          win_id.append(-1)
         else:
           win_emb[0][j*50:(j+1)*50] = self.ch_embeddings[self.sentence[sen_id][0][sen_pos]]
-          win_id = self.sentence[sen_id][0][sen_pos]
+          win_id.append(self.sentence[sen_id][0][sen_pos])
       else:
         if sen_pos< 0 or sen_pos > sen_len-1:
           win_emb[0][j*50:(j+1)*50] = 0.0 
-          win_id[0][j] = -1
+          win_id.append(-1)
         else:
           win_emb[0][j*50:(j+1)*50] = self.en_embeddings[self.sentence[sen_id][1][sen_pos]]
-          win_id = self.sentence[sen_id][1][sen_pos]
+          win_id.append(self.sentence[sen_id][1][sen_pos])
       j += 1
 
     return win_emb, win_id 
@@ -184,8 +189,7 @@ class train_worker(object):
     train_handle = train(pl_input, pr_input, nl_input, nr_input, allparams=allparams, alpha=alpha,\
                        learning_rate=lr)
 
-    f = theano.function(inputs=[pl_input, pr_input, nl_input, nr_input, lr],outputs=(train_handle.gpl_input,\
-                        train_handle.gpr_input, train_handle.gnl_input, train_handle.gnr_input),\
+    f = theano.function(inputs=[pl_input, pr_input, nl_input, nr_input, lr],outputs=train_handle.output,\
                         updates=train_handle.updates)
     
     self.gen_vocab()
@@ -209,16 +213,17 @@ class train_worker(object):
 
     for i in xrange(self.sen_num):
       learning_rate = start_learning_rate*(1.0-float(i)/self.sen_num)
+      sys.stdout.flush()
       sys.stdout.write( "num:"+str(i)+"\tlr:"+str(learning_rate)+"\r")
-      if i%100000==0:
+      if i%10000==0:
         storedata(self.en_embeddings,str(i)+"en_embeddings.pkl")
         storedata(self.ch_embeddings,str(i)+"ch_embeddings.pkl")
         
       sen = self.sentence[i]
       
       for j in xrange(len(sen[2])):
-        orch_win_em, orch_win_id = get_window(sen[2][j][0],i,ch=1)
-        oren_win_em, oren_win_id = get_window(sen[2][j][1],i,ch=0)
+        orch_win_em, orch_win_id = self.get_window(sen[2][j][0],i,ch=1)
+        oren_win_em, oren_win_id = self.get_window(sen[2][j][1],i,ch=0)
 
         flag1 = [] 
         for k in range(100):
@@ -269,29 +274,54 @@ class train_worker(object):
             
         
         a = f(pl_input, pr_input, nl_input, nr_input, learning_rate)
-        """
-        for k in range(100):
+        
+        for k in xrange(100):
           if flag1[k]:
-            self.ch_embeddings[sen[0][sen[2][j][0]]] += a[0][k][0:50]*learning_rate*-1.0
-            self.en_embeddings[sen[1][sen[2][j][1]]] += a[0][k][50:100]*learning_rate*-1.0
+            for ii in xrange(5):
+              if orch_win_id[ii] != -1:
+                self.ch_embeddings[orch_win_id[ii]] += a[0][k][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if oren_win_id[ii] != -1:
+                self.en_embeddings[oren_win_id[ii]] += a[1][k][ii*50:(ii+1)*50]*learning_rate*-1.0
           else:
-            self.ch_embeddings[sen[0][sen[2][j][0]]] += a[0][k][50:100]*learning_rate*-1.0
-            self.en_embeddings[sen[1][sen[2][j][1]]] += a[0][k][0:50]*learning_rate*-1.0
-
-        for ll in range(50):
+            for ii in xrange(5):
+              if orch_win_id[ii] != -1:
+                self.ch_embeddings[orch_win_id[ii]] += a[1][k][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if oren_win_id[ii] != -1:
+                self.en_embeddings[oren_win_id[ii]] += a[0][k][ii*50:(ii+1)*50]*learning_rate*-1.0
+        
+        for ll in xrange(50):
           if flag2[ll]:
-            self.ch_embeddings[sen[0][sen[2][j][0]]] += a[1][ll][0:50]*learning_rate*-1.0 
-            self.en_embeddings[neg_list[ll]] += a[1][ll][50:100]*learning_rate*-1.0
+            for ii in xrange(5):
+              if orch_win_id[ii] != -1:
+                self.ch_embeddings[orch_win_id[ii]] += a[2][ll][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if oren_win_id[ii] != -1 and ii != 2:
+                self.en_embeddings[oren_win_id[ii]] += a[3][ll][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if ii==2:
+                self.en_embeddings[neg_list[ll]] += a[3][ll][100:150]*learning_rate*-1.0
+              
+              if oren_win_id[ii] != -1:
+                self.en_embeddings[oren_win_id[ii]] += a[2][ll+50][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if orch_win_id[ii] != -1 and ii != 2:
+                self.ch_embeddings[orch_win_id[ii]] += a[3][ll+50][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if ii==2:
+                self.ch_embeddings[neg_list[ll+50]] += a[3][ll+50][100:150]*learning_rate*-1.0
 
-            self.ch_embeddings[neg_list[ll+50]] += a[1][ll+50][0:50]*learning_rate*-1.0
-            self.en_embeddings[sen[1][sen[2][j][1]]] += a[1][ll+50][50:100]*learning_rate*-1.0
           else:
-            self.ch_embeddings[sen[0][sen[2][j][0]]] += a[1][ll][50:100]*learning_rate*-1.0 
-            self.en_embeddings[neg_list[ll]] += a[1][ll][0:50]*learning_rate*-1.0
-
-            self.ch_embeddings[neg_list[ll+50]] += a[1][ll+50][50:100]*learning_rate*-1.0
-            self.en_embeddings[sen[1][sen[2][j][1]]] += a[1][ll+50][0:50]*learning_rate*-1.0
-        """
+            for ii in xrange(5):
+              if oren_win_id[ii] != -1:
+                self.en_embeddings[oren_win_id[ii]] += a[2][ll][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if orch_win_id[ii] != -1 and ii != 2:
+                self.ch_embeddings[orch_win_id[ii]] += a[3][ll][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if ii==2:
+                self.ch_embeddings[neg_list[ll+50]] += a[3][ll][100:150]*learning_rate*-1.0
+              
+              if orch_win_id[ii] != -1:
+                self.ch_embeddings[orch_win_id[ii]] += a[2][ll+50][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if oren_win_id[ii] != -1 and ii != 2:
+                self.en_embeddings[oren_win_id[ii]] += a[3][ll+50][ii*50:(ii+1)*50]*learning_rate*-1.0
+              if ii==2:
+                self.en_embeddings[neg_list[ll]] += a[3][ll+50][100:150]*learning_rate*-1.0
+        
 if __name__ == '__main__':
   start = time.time()
   handle = train_worker()
